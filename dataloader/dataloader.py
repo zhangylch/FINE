@@ -1,0 +1,205 @@
+import jax 
+import jax.numpy as jnp
+import numpy as np
+import dataloader.read_xyz as read_xyz
+import fortran.getneigh as getneigh
+
+
+class Dataloader():
+    def __init__(self, maxneigh_per_node, batchsize, local_size=1, ncyc=5, initpot=0.0, cutoff=5.0, datafolder="./", ene_shift=True, force_table=True, stress_table=False, dipole_table=False, bec_table=False, cross_val=True, jnp_dtype="float32", seed=0, eval_mode=False, Fshuffle=True, ntrain=10,  capacity=1.5, node_cap=1.0, edge_cap=1.0):
+            
+        self.cutoff = cutoff
+        self.capacity = capacity
+        self.batchsize = batchsize
+        self.ncyc = ncyc
+        self.local_size = local_size
+        self.force_table = force_table
+        self.stress_table = stress_table
+        self.dipole_table = dipole_table
+        self.bec_table = bec_table
+        self.cross_val = cross_val
+        self.seed = seed
+        self.maxneigh_per_node = maxneigh_per_node
+
+
+        if "32" in jnp_dtype:
+            self.int_dtype = np.int32
+            self.float_dtype = np.float32
+        else:
+            self.int_dtype = np.int64
+            self.float_dtype = np.float64
+
+        coordinates, field, cell, pbc, species, numatoms, pot, force_list, stress, dipole, bec_list =  \
+        read_xyz.read_xyz(datafolder, force_table=force_table, stress_table=stress_table, dipole_table=dipole_table, bec_table=bec_table)
+        
+        numatoms = np.array(numatoms)
+        ave_node = np.mean(numatoms)
+        self.batchnode = int(node_cap * ave_node * batchsize)
+        self.numpoint = numatoms.shape[0]
+        pot = np.array(pot)
+        
+        if ene_shift:
+            if not eval_mode:
+                initpot = np.sum(pot)/np.sum(numatoms)
+            pot = pot - initpot * numatoms
+        else:
+            pot = pot - initpot
+
+        self.initpot = initpot
+        self.numatoms = np.array(numatoms).astype(self.int_dtype)
+        self.pbc = np.array(pbc)
+        self.field = np.array(field).astype(self.float_dtype)
+        self.dipole = np.array(dipole).astype(self.float_dtype) if dipole_table else None
+        self.coordinates = coordinates
+        self.maxnumatom = np.max(self.numatoms)
+        print("tot_nodes in each calculation:", self.batchnode)
+        print("max number of atoms:", self.maxnumatom)
+        print("min number of atoms:", np.min(self.numatoms))
+        print("average number of atoms:", ave_node)
+        self.maxneigh = int(maxneigh_per_node * ave_node * batchsize / edge_cap) + 1
+        if self.maxneigh < self.maxnumatom * maxneigh_per_node:
+            raise RuntimeError("Error the given maximal neigh node of each batch is less than maxnumatom * maxneigh_per_node, please increase the batchsize or decrease edge_cap")
+        elif self.batchnode < self.maxnumatom:
+            raise RuntimeError("Error the given maximal centeral node of each node is less than maxnumatom, please increase the batchsize or node_cap")
+         
+        cell = np.array(cell)
+        expand_species = np.ones((self.numpoint, self.maxnumatom), dtype=self.int_dtype)
+
+        if force_table:
+            force = np.zeros((self.numpoint, self.maxnumatom, 3))
+        if bec_table:
+            bec = np.zeros((self.numpoint, self.maxnumatom, 9))
+
+        # The purpose of these codes is to process conformational data consisting of different numbers of atoms into a regular tensor.
+        for i in range(self.numpoint):
+            expand_species[i, 0:self.numatoms[i]] = np.array(species[i], dtype=self.int_dtype)
+            expand_species[i, self.numatoms[i]:] = expand_species[i, 0]
+            if force_table:
+                force[i, 0:self.numatoms[i]] = -force_list[i]
+            if bec_table:
+                bec[i, 0:self.numatoms[i]] = -bec_list[i]
+        
+        if force_table:
+            self.std = np.sqrt(np.sum(np.square(force)) / (3*np.sum(self.numatoms)))
+        else:
+            self.std = 1.0
+ 
+        #  statical over species
+        reduce_spec = np.unique(expand_species)
+        self.nspec = reduce_spec.shape[0]
+        self.reduce_spec = reduce_spec.astype(self.float_dtype)
+        x, y = np.meshgrid(self.reduce_spec, self.reduce_spec)
+        self.com_spec = np.stack([y.ravel(), x.ravel()], axis=1).astype(self.float_dtype)
+       
+ 
+        if Fshuffle:
+            self.shuffle_list = np.random.RandomState(seed=self.seed).permutation(self.numpoint)
+        else: 
+            self.shuffle_list = np.arange(self.numpoint) 
+
+        self.size_per_step = self.batchsize * ncyc * local_size
+        self.ntrain = ntrain
+        self.nval = self.numpoint - self.ntrain
+
+        self.species = expand_species
+        if force_table: self.force = force.astype(self.float_dtype)
+        if stress_table: self.stress = np.array(stress).astype(self.float_dtype)
+        if bec_table: self.bec = bec.reshape(self.numpoint, self.maxnumatom, 3, 3).astype(self.float_dtype)
+        self.cell = cell
+        self.pot = pot.astype(self.float_dtype)
+        self.train_mode = True
+         
+        print("initpot = {} \n".format(initpot))
+        print("reduce_spec = {} \n".format(self.reduce_spec))
+      
+    def __iter__(self):
+        self.ipoint = 0
+        self.train_mode= True
+        return self
+
+    def __next__(self):
+        if self.ipoint < self.numpoint - 0.5:
+            coor = np.zeros((self.local_size, self.ncyc, self.batchnode, 3))
+            if self.force_table: force = np.zeros((self.local_size, self.ncyc, self.batchnode, 3))
+            species = np.full((self.local_size, self.ncyc, self.batchnode), self.reduce_spec[0])
+            center_factor = np.zeros((self.local_size, self.ncyc, self.batchnode))
+            neighlist = np.full((self.local_size, self.ncyc, 2, self.maxneigh), self.batchnode - 1, dtype=np.int32)
+            celllist = np.full((self.local_size, self.ncyc, self.batchnode), self.batchsize - 1, dtype=np.int32)
+            shiftimage = np.zeros((self.local_size, self.ncyc, 3, self.maxneigh))
+            cell = np.tile(np.eye(3), (self.local_size, self.ncyc, self.batchsize, 1, 1))
+            field = np.zeros((self.local_size, self.ncyc, self.batchsize, 3))
+            if self.stress_table: stress = np.zeros((self.local_size, self.ncyc, self.batchsize, 3, 3))
+            if self.dipole_table: dipole = np.zeros((self.local_size, self.ncyc, self.batchsize, 3))
+            if self.bec_table: bec = np.zeros((self.local_size, self.ncyc, self.batchnode, 3, 3))
+            pot = np.zeros((self.local_size, self.ncyc, self.batchsize))
+            numatoms = np.ones((self.local_size, self.ncyc, self.batchsize))
+            break_mode = False
+            for igpu in range(self.local_size):
+                if break_mode: break
+                for icyc in range(self.ncyc):
+                    if break_mode: break
+                    inode = 0
+                    ineigh = 0
+                    ibatch = 0
+                    while True:
+                        if  ibatch > self.batchsize-0.5: break
+                        if self.ipoint > self.ntrain - 0.5 and self.train_mode: 
+                            self.train_mode= False
+                            break_mode = True
+                            break
+                        if self.ipoint > self.numpoint - 0.5: 
+                            break_mode = True
+                            break 
+                        inum = self.shuffle_list[self.ipoint]
+                        numatom = self.numatoms[inum]
+                        if ineigh + self.maxneigh_per_node * numatom > self.maxneigh + 0.5 or inode + numatom > self.batchnode + 0.5: break
+                        icell = self.cell[inum].T
+                        icart = self.coordinates[inum]
+                        ipbc = self.pbc[inum]
+                        getneigh.init_neigh(self.cutoff, self.cutoff, icell, ipbc, self.capacity)
+                        cart, tmp, tmp1, scutnum = getneigh.get_neigh(icart, np.int32(self.maxneigh_per_node * numatom))
+                        coor[igpu, icyc, inode:inode+numatom] = cart.T
+                        if self.force_table: force[igpu, icyc, inode:inode+numatom] = self.force[inum, :numatom]
+                        if self.stress_table: stress[igpu, icyc, ibatch] = self.stress[inum]
+                        if self.dipole_table: dipole[igpu, icyc, ibatch] = self.dipole[inum]
+                        if self.bec_table: bec[igpu, icyc, inode:inode+numatom] = self.bec[inum, :numatom]
+                        species[igpu, icyc, inode:inode+numatom] = self.species[inum, :numatom]
+                        cell[igpu, icyc, ibatch] = self.cell[inum]
+                        field[igpu, icyc, ibatch] = self.field[inum]
+                        celllist[igpu, icyc, inode:inode+numatom] = ibatch
+                        neighlist[igpu, icyc, :, ineigh:ineigh+scutnum] = tmp[:, :scutnum] + inode
+                        shiftimage[igpu, icyc, :, ineigh:ineigh+scutnum] = tmp1[:, :scutnum]
+                        pot[igpu, icyc, ibatch] = self.pot[inum]
+                        numatoms[igpu, icyc, ibatch] = numatom
+                        self.ipoint +=1
+                        inode += numatom
+                        ibatch +=1
+                        ineigh += scutnum
+
+                    center_factor[igpu, icyc, :inode] = np.array(1.0, dtype = self.float_dtype)
+                    neighlist[igpu, icyc, :, ineigh:] = self.batchnode-1
+                    celllist[igpu, icyc, inode:] = self.batchsize-1
+                    species[igpu, icyc, inode:] = self.reduce_spec[0]
+
+            abprop = (pot,)
+            if self.force_table:
+                abprop = abprop + (force,)
+            if self.stress_table:
+                abprop = abprop + (stress,)
+            if self.dipole_table:
+                abprop = abprop + (dipole,)
+            if self.bec_table:
+                abprop = abprop + (bec,)
+             
+            return self.ipoint, coor.astype(self.float_dtype), field.astype(self.float_dtype), cell.astype(self.float_dtype), neighlist.astype(self.int_dtype), celllist.astype(self.int_dtype), shiftimage.astype(self.float_dtype), center_factor.astype(self.float_dtype), species.astype(self.float_dtype), numatoms.astype(self.float_dtype), abprop
+        else:
+            if self.cross_val:
+                self.seed = self.seed+1
+                self.shuffle_list = np.random.RandomState(seed=self.seed).permutation(self.numpoint)
+            else:
+                self.seed = self.seed+1
+                shuffle_list1 = np.random.RandomState(seed=self.seed).permutation(self.shuffle_list[:self.ntrain])
+                self.shuffle_list[:self.ntrain] = shuffle_list1
+                shuffle_list1 = np.random.RandomState(seed=self.seed).permutation(self.shuffle_list[self.ntrain:])
+                self.shuffle_list[self.ntrain:] = shuffle_list1
+            raise StopIteration
