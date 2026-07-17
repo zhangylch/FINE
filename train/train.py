@@ -276,10 +276,11 @@ def make_gradient(energy_model):
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
             delta_bec = (abbec - nnbec) * center_factor[:, None, None]
+            bec_norm = (jnp.array(9.0) * numatoms[celllist])[:, None, None]
             loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / numatoms)) \
                  + weight[1] * jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None]) \
                  + weight[2] * jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0) \
-                 + weight[3] * jnp.sum(jnp.square(delta_bec)) / jnp.array(9.0)
+                 + weight[3] * jnp.sum(jnp.square(delta_bec) / bec_norm)
         elif full_config.force_table and full_config.dipole_table:
             abpot, abforce, abdipole = abprop
             nnpot, nnforce, nndipole = nnprop
@@ -340,7 +341,8 @@ def make_loss(pes_model, nprop):
             loss1 = jnp.sum(jnp.square((abpot - nnpot) / numatoms)) 
             loss2 = jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None])
             loss3 = jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0)
-            loss4 = jnp.sum(jnp.square(delta_bec)) / jnp.array(9.0)
+            bec_norm = (jnp.array(9.0) * numatoms[celllist])[:, None, None]
+            loss4 = jnp.sum(jnp.square(delta_bec) / bec_norm)
             ploss = jnp.stack([loss1, loss2, loss3, loss4])
             loss = loss1*weight[0] + loss2*weight[1] + loss3*weight[2] + loss4*weight[3]
         elif full_config.force_table and full_config.dipole_table:

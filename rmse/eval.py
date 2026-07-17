@@ -30,6 +30,7 @@ data_load = dataloader.Dataloader(full_config.maxneigh_per_node, full_config.bat
 #ntrain = data_load.ntrain
 numatoms = data_load.numatoms[:full_config.ntrain]
 ntrain = full_config.ntrain#jnp.sum(numatoms * numatoms)
+natom = np.sum(numatoms)
 nforce = np.sum(numatoms) * 3
 
 nprop = 1
@@ -39,7 +40,7 @@ if full_config.stress_table:
     prop_length = jnp.array(np.array([ntrain, nforce, full_config.ntrain*9]))
 elif full_config.force_table and full_config.dipole_table and full_config.bec_table:
     nprop = 4
-    prop_length = jnp.array(np.array([ntrain, nforce, 3*full_config.ntrain, ntrain*9]))
+    prop_length = jnp.array(np.array([ntrain, nforce, 3*full_config.ntrain, natom*9]))
 elif full_config.force_table and full_config.dipole_table:
     nprop = 3
     prop_length = jnp.array(np.array([ntrain, nforce, 3*full_config.ntrain]))
