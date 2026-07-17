@@ -97,11 +97,11 @@ class ResidualBlock(nnx.Module):
             x = jax.nn.silu(x)
             x = layer(x)
 
-        residual_scale = jnp.array(self.residual_scale, dtype=self.dtype)
-        residual_norm = jnp.sqrt(
-            jnp.array(1.0, dtype=self.dtype) + residual_scale * residual_scale
+        dtype_scale = jnp.array(self.residual_scale, dtype=self.dtype)
+        dtype_norm = jnp.sqrt(
+            jnp.array(1.0, dtype=self.dtype) + dtype_scale * dtype_scale
         )
-        x = (x + residual * residual_norm) / residual_norm
+        x = (x + residual * dtype_norm) / dtype_norm
         return x
 
 
