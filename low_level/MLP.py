@@ -101,7 +101,7 @@ class ResidualBlock(nnx.Module):
         dtype_norm = jnp.sqrt(
             jnp.array(1.0, dtype=self.dtype) + dtype_scale * dtype_scale
         )
-        x = (x + residual * dtype_norm) / dtype_norm
+        x = (x + residual * dtype_scale) / dtype_norm
         return x
 
 
