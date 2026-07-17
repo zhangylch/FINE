@@ -134,7 +134,7 @@ class MPNNCore(nnx.Module):
             rngs=rngs,
         )
         self.FieldNN_init = MLP.MLP(
-            in_features=config.nwave,
+            in_features=1,
             num_output=config.prmaxl * config.nwave,
             num_blocks=config.out_nl[0],
             features=config.out_nl[1],
@@ -148,7 +148,7 @@ class MPNNCore(nnx.Module):
         )
         self.FieldNN_list = nnx.List([
             MLP.MLP(
-                in_features=(2 + iMP_loop) * config.nwave,
+                in_features=1,
                 num_output=config.rmaxl * config.nwave,
                 num_blocks=config.out_nl[0],
                 features=config.out_nl[1],
@@ -341,8 +341,9 @@ class MPNNCore(nnx.Module):
         pindex_l = self.config.index_l[:pnorb_i]
         node_field_intensity = field_intensity[celllist]
         sph_field_node = sph_field[celllist]
-        field_coeff = self.FieldNN_init(density * node_field_intensity[:, None]).reshape(nnode, prmaxl_i, nwave_i)
-        field_coeff = field_coeff / (node_field_intensity[:, None, None] * jnp.sqrt(dtype_2))
+        field_input = node_field_intensity[:, None]
+        field_coeff = self.FieldNN_init(field_input).reshape(nnode, prmaxl_i, nwave_i)
+        field_coeff = field_coeff / jnp.sqrt(dtype_2)
         field_orbital = jnp.einsum("ij, ijk -> ijk", sph_field_node[:, :pnorb_i], field_coeff[:, pindex_l])
         density_norm = jnp.reciprocal(jnp.sqrt((dtype_2 * pindex_l.astype(dtype) + dtype_1) * prmaxl_f))
         worbital = jnp.einsum("ijk, ij -> ijk", wradial[:, pindex_l], sph[:, :pnorb_i])
@@ -364,10 +365,8 @@ class MPNNCore(nnx.Module):
             density1 = jnp.sum(sum_orb * norm_corb, axis=1)
             density = jnp.concatenate((density, density1), axis=1)
 
-            field_coeff = self.FieldNN_list[iter_loop](
-                density * node_field_intensity[:, None]
-            ).reshape(nnode, rmaxl_i, nwave_i)
-            field_coeff = field_coeff / (node_field_intensity[:, None, None] * jnp.sqrt(dtype_2))
+            field_coeff = self.FieldNN_list[iter_loop](field_input).reshape(nnode, rmaxl_i, nwave_i)
+            field_coeff = field_coeff / jnp.sqrt(dtype_2)
             field_orbital = jnp.einsum(
                 "ij, ijk -> ijk",
                 sph_field_node,
