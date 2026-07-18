@@ -111,7 +111,7 @@ def make_loss(pes_model, nprop):
             abpot, abforce, abdipole, abbec = abprop
             nnpot, nnforce, nndipole, nnbec = nnprop
             delta_dipole = abdipole - nndipole
-            int_modulo = jnp.trunc(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
+            int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
             delta_bec = (abbec - nnbec) * center_factor[:, None, None]
@@ -123,7 +123,7 @@ def make_loss(pes_model, nprop):
             abpot, abforce, abdipole = abprop
             nnpot, nnforce, nndipole = nnprop
             delta_dipole = abdipole - nndipole
-            int_modulo = jnp.trunc(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
+            int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
             ploss = ploss.at[0].set(jnp.sum(jnp.abs(nnpot - abpot)))
@@ -133,7 +133,7 @@ def make_loss(pes_model, nprop):
             abpot, abdipole = abprop
             nnpot, nndipole = nnprop
             delta_dipole = abdipole - nndipole
-            int_modulo = jnp.trunc(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
+            int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
             ploss = ploss.at[0].set(jnp.sum(jnp.abs(nnpot - abpot)))
