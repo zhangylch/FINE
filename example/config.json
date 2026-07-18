@@ -3,13 +3,13 @@
     "force_table": true,
     "stress_table": false,
     "dipole_table": true,
-    "bec_table": true,
+    "bec_table": false,
     "stress_sign": 1,
     "dipole_sign": -1,
     "bec_sign": 1,
     "restart": false,
     "jnp_dtype": "float32",
-    "batchsize": 8,
+    "batchsize": 1,
     "ncyc": 8,
     "ntrain": 51,
     "Fshuffle": true,
@@ -18,13 +18,11 @@
     "init_weight": [
         0.1,
         10.0,
-        0.1,
-        10.0
+        0.2
     ],
     "final_weight": [
         0.1,
         1.0,
-        0.1,
         1.0
     ],
     "queue_size": 2,
@@ -36,9 +34,9 @@
     "pn": 6,
     "cross_val": false,
     "Epoch": 20000,
-    "warm_lr": 0.001,
+    "warm_lr": 0.01,
     "warm_epoch": 20,
-    "slr": 0.01,
+    "slr": 0.05,
     "elr": 1e-05,
     "patience_step": 200,
     "cooldown": 0,
@@ -48,7 +46,7 @@
     "cutoff": 6.0,
     "node_cap": 1.0,
     "edge_cap": 1.0,
-    "npaircode": 16,
+    "npaircode": 64,
     "max_l": 2,
     "pmax_l": 2,
     "nwave": 8,
@@ -59,19 +57,19 @@
     "tp_mode": "full",
     "emb_nl": [
         2,
-        32,
+        64,
         1,
         false
     ],
     "radial_nl": [
         2,
-        32,
+        64,
         1,
         false
     ],
     "MP_nl": [
         2,
-        32,
+        64,
         1,
         false
     ],
