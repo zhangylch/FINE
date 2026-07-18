@@ -33,6 +33,22 @@ def zero_nonfinite_gradients(grads):
     return jax.tree_util.tree_map(clean_leaf, grads)
 
 
+def loss_normalizers(center_factor, celllist, numatoms):
+    dtype = center_factor.dtype
+    graph_atoms = jax.ops.segment_sum(
+        center_factor,
+        celllist,
+        num_segments=numatoms.shape[0],
+    )
+    graph_mask = (graph_atoms > 0).astype(dtype)
+    atom_mask = center_factor.astype(dtype)
+    safe_numatoms = jnp.maximum(numatoms, jnp.array(1.0, dtype=dtype))
+    atom_numatoms = safe_numatoms[celllist]
+    # Denominator for masked batch means; raw jnp.mean would include padding graphs.
+    graph_count = jnp.maximum(jnp.sum(graph_mask), jnp.array(1.0, dtype=dtype))
+    return graph_mask, atom_mask, safe_numatoms, atom_numatoms, graph_count
+
+
 # train function
 def train(params, ema_params, config, optim, opt_state, lr_state, schedule_fn, value_and_grad_fn, value_fn, data_load, warm_lr, slr, elr, warm_epoch, Epoch, ncyc, ntrain, nval, nprop, start_step):
 
@@ -44,6 +60,7 @@ def train(params, ema_params, config, optim, opt_state, lr_state, schedule_fn, v
                 params, opt_state, ema_params, scale, weight, coor, field, cell, disp_cell, neighlist, celllist, shiftimage, center_factor, species, numatoms, abprop, loss_fn = carry
                 inabprop = (iabprop[i] for iabprop in abprop)
                 loss, grads = value_and_grad_fn(params, coor[i], field[i], cell[i], disp_cell[i], neighlist[i], celllist[i], shiftimage[i], center_factor[i], species[i], numatoms[i], inabprop, weight)
+                _, _, _, _, graph_count = loss_normalizers(center_factor[i], celllist[i], numatoms[i])
                 grads = zero_nonfinite_gradients(grads)
                 grads = jax.lax.pmean(grads, axis_name="train_GPUs")
                 grads = zero_nonfinite_gradients(grads)
@@ -51,7 +68,7 @@ def train(params, ema_params, config, optim, opt_state, lr_state, schedule_fn, v
                 updates = otu.tree_scalar_mul(scale, updates)
                 params = optax.apply_updates(params, updates)
                 ema_params = optax.incremental_update(params, ema_params, 0.001)
-                loss_fn += loss
+                loss_fn += loss * graph_count
                 return params, opt_state, ema_params, scale, weight, coor, field, cell, disp_cell, neighlist, celllist, shiftimage, center_factor, species, numatoms, abprop, loss_fn
             
             coor, field, cell, neighlist, celllist, shiftimage, center_factor, species, numatoms, abprop = data
@@ -262,12 +279,13 @@ def make_gradient(energy_model):
     def wf_loss(params, coor, field, cell, disp_cell, neighlist, celllist, shiftimage, center_factor, species, numatoms, abprop, weight):
 
         nnprop = energy_model(params, coor, field, cell, disp_cell, neighlist, celllist, shiftimage, center_factor, species)
+        graph_mask, atom_mask, safe_numatoms, atom_numatoms, graph_count = loss_normalizers(center_factor, celllist, numatoms)
         if full_config.stress_table:
             abpot, abforce, abstress = abprop
             nnpot, nnforce, nnstress = nnprop
-            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / numatoms)) \
-                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None]) \
-                 + weight[2] * jnp.sum(jnp.square(abstress - nnstress) / jnp.array(9.0)) 
+            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask) \
+                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None]) \
+                 + weight[2] * jnp.sum(jnp.square(abstress - nnstress) * graph_mask[:, None, None] / jnp.array(9.0))
         elif full_config.force_table and full_config.dipole_table and full_config.bec_table:
             abpot, abforce, abdipole, abbec = abprop
             nnpot, nnforce, nndipole, nnbec = nnprop
@@ -275,12 +293,11 @@ def make_gradient(energy_model):
             int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
-            delta_bec = (abbec - nnbec) * center_factor[:, None, None]
-            bec_norm = (jnp.array(9.0) * numatoms[celllist])[:, None, None]
-            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / numatoms)) \
-                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None]) \
-                 + weight[2] * jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0) \
-                 + weight[3] * jnp.sum(jnp.square(delta_bec) / bec_norm)
+            delta_bec = abbec - nnbec
+            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask) \
+                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None]) \
+                 + weight[2] * jnp.sum(jnp.square(delta_dipole) * graph_mask[:, None] / jnp.array(3.0)) \
+                 + weight[3] * jnp.sum(jnp.square(delta_bec) * atom_mask[:, None, None] / (jnp.array(9.0) * atom_numatoms)[:, None, None])
         elif full_config.force_table and full_config.dipole_table:
             abpot, abforce, abdipole = abprop
             nnpot, nnforce, nndipole = nnprop
@@ -288,14 +305,14 @@ def make_gradient(energy_model):
             int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
-            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / numatoms)) \
-                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None]) \
-                 + weight[2] * jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0)
+            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask) \
+                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None]) \
+                 + weight[2] * jnp.sum(jnp.square(delta_dipole) * graph_mask[:, None] / jnp.array(3.0))
         elif full_config.force_table:
             abpot, abforce = abprop
             nnpot, nnforce = nnprop
-            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / numatoms)) \
-                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None])
+            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask) \
+                 + weight[1] * jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None])
         elif full_config.dipole_table:
             abpot, abdipole = abprop
             nnpot, nndipole = nnprop
@@ -303,14 +320,14 @@ def make_gradient(energy_model):
             int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
-            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / numatoms)) \
-                 + weight[1] * jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0)
+            loss = weight[0] * jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask) \
+                 + weight[1] * jnp.sum(jnp.square(delta_dipole) * graph_mask[:, None] / jnp.array(3.0))
         else:
             abpot, = abprop
             nnpot, = nnprop
-            loss = jnp.sum(jnp.square((abpot - nnpot) / numatoms)) * weight[0]
+            loss = jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask) * weight[0]
         
-        return loss
+        return loss / graph_count
 
 
     return jax.value_and_grad(wf_loss)
@@ -322,12 +339,13 @@ def make_loss(pes_model, nprop):
     def get_loss(params, coor, field, cell, disp_cell, neighlist, celllist, shiftimage, center_factor, species, numatoms, abprop, weight):
 
         nnprop = pes_model(params, coor, field, cell, disp_cell, neighlist, celllist, shiftimage, center_factor, species)
+        graph_mask, atom_mask, safe_numatoms, atom_numatoms, _ = loss_normalizers(center_factor, celllist, numatoms)
         if full_config.stress_table:
             abpot, abforce, abstress = abprop
             nnpot, nnforce, nnstress = nnprop
-            loss1 = jnp.sum(jnp.square((abpot - nnpot) / numatoms)) 
-            loss2 = jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None]) 
-            loss3 = jnp.sum(jnp.square(abstress - nnstress) / jnp.array(9.0)) 
+            loss1 = jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask)
+            loss2 = jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None])
+            loss3 = jnp.sum(jnp.square(abstress - nnstress) * graph_mask[:, None, None] / jnp.array(9.0))
             ploss = jnp.stack([loss1, loss2, loss3])
             loss = loss1*weight[0] + loss2*weight[1] + loss3*weight[2]
         elif full_config.force_table and full_config.dipole_table and full_config.bec_table:
@@ -337,12 +355,11 @@ def make_loss(pes_model, nprop):
             int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
-            delta_bec = (abbec - nnbec) * center_factor[:, None, None]
-            loss1 = jnp.sum(jnp.square((abpot - nnpot) / numatoms)) 
-            loss2 = jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None])
-            loss3 = jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0)
-            bec_norm = (jnp.array(9.0) * numatoms[celllist])[:, None, None]
-            loss4 = jnp.sum(jnp.square(delta_bec) / bec_norm)
+            delta_bec = abbec - nnbec
+            loss1 = jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask)
+            loss2 = jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None])
+            loss3 = jnp.sum(jnp.square(delta_dipole) * graph_mask[:, None] / jnp.array(3.0))
+            loss4 = jnp.sum(jnp.square(delta_bec) * atom_mask[:, None, None] / (jnp.array(9.0) * atom_numatoms)[:, None, None])
             ploss = jnp.stack([loss1, loss2, loss3, loss4])
             loss = loss1*weight[0] + loss2*weight[1] + loss3*weight[2] + loss4*weight[3]
         elif full_config.force_table and full_config.dipole_table:
@@ -352,16 +369,16 @@ def make_loss(pes_model, nprop):
             int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
-            loss1 = jnp.sum(jnp.square((abpot - nnpot) / numatoms)) 
-            loss2 = jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None])
-            loss3 = jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0)
+            loss1 = jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask)
+            loss2 = jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None])
+            loss3 = jnp.sum(jnp.square(delta_dipole) * graph_mask[:, None] / jnp.array(3.0))
             ploss = jnp.stack([loss1, loss2, loss3])
             loss = loss1*weight[0] + loss2*weight[1] + loss3*weight[2]
         elif full_config.force_table:
             abpot, abforce = abprop
             nnpot, nnforce = nnprop
-            loss1 = jnp.sum(jnp.square((abpot - nnpot) / numatoms)) 
-            loss2 = jnp.sum(jnp.square(abforce - nnforce) / (jnp.array(3.0) * numatoms[celllist])[:, None])
+            loss1 = jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask)
+            loss2 = jnp.sum(jnp.square(abforce - nnforce) * atom_mask[:, None] / (jnp.array(3.0) * atom_numatoms)[:, None])
             ploss = jnp.stack([loss1, loss2])
             loss = loss1*weight[0] + loss2*weight[1]
         elif full_config.dipole_table:
@@ -371,14 +388,14 @@ def make_loss(pes_model, nprop):
             int_modulo = jnp.round(jnp.einsum("ij,ijk->ik", delta_dipole, jnp.linalg.inv(cell)))
             modulo_dipole = jnp.einsum("ij,ijk->ik", int_modulo, cell)
             delta_dipole = delta_dipole - jax.lax.stop_gradient(modulo_dipole)
-            loss1 = jnp.sum(jnp.square((abpot - nnpot) / numatoms))
-            loss2 = jnp.sum(jnp.square(delta_dipole)) / jnp.array(3.0)
+            loss1 = jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask)
+            loss2 = jnp.sum(jnp.square(delta_dipole) * graph_mask[:, None] / jnp.array(3.0))
             ploss = jnp.stack([loss1, loss2])
             loss = loss1*weight[0] + loss2*weight[1]
         else:
             abpot, = abprop
             nnpot, = nnprop
-            ploss = jnp.sum(jnp.square((abpot - nnpot) / numatoms))
+            ploss = jnp.sum(jnp.square((abpot - nnpot) / safe_numatoms) * graph_mask)
             loss = ploss * weight[0]
         return loss, ploss
 
